@@ -1,0 +1,21 @@
+# Python virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.ipynb_checkpoints/
+
+# Large PyTorch models & checkpoints (>100MB violates GitHub limits)
+checkpoints/history/
+*.pt
+*.pth
+
+# Large preprocessed datasets
+datasets/*.pt
+datasets/*.csv
+
+# Temporary outputs & logs
+*.log
+plots/temp/
+data/
