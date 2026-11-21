@@ -1,144 +1,188 @@
-"""Explainability module for Forest Cover Type Federated Learning model."""
+"""Standalone script to run PFI and LIME explainability on saved FL model."""
 
 from pathlib import Path
-from typing import Dict, List, Tuple
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+import numpy as np
 
-# 54 feature names corresponding to the Forest Cover Type dataset
-FEATURE_NAMES: List[str] = [
-    # 10 Continuous terrain features
-    "Elevation",
-    "Aspect",
-    "Slope",
-    "Horizontal_Dist_Hydrology",
-    "Vertical_Dist_Hydrology",
-    "Horizontal_Dist_Roadways",
-    "Hillshade_9am",
-    "Hillshade_Noon",
-    "Hillshade_3pm",
-    "Horizontal_Dist_Fire_Points",
-    # 4 Wilderness Area indicators
-    "Wilderness_Rawah",
-    "Wilderness_Neota",
-    "Wilderness_Comanche_Peak",
-    "Wilderness_Cache_la_Poudre",
-] + [f"Soil_Type_{i}" for i in range(1, 41)]  # 40 Soil Types
-
-CLASS_NAMES: List[str] = [
-    "Spruce/Fir",
-    "Lodgepole Pine",
-    "Ponderosa Pine",
-    "Cottonwood/Willow",
-    "Aspen",
-    "Douglas-fir",
-    "Krummholz",
-]
+from federated_app.config import AppConfig
+from federated_app.task import (
+    Net,
+    load_centralized_test_data,
+    load_covtype_data,
+)
+from federated_app.explainability import ModelExplainer
 
 
-class ModelExplainer:
-    """Computes Global and Local Feature Attributions for the FL Model."""
+def to_numpy(data):
+    """Convert data to NumPy if it is a Torch tensor."""
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().numpy()
+    return np.asarray(data)
 
-    def __init__(self, model: nn.Module, device: torch.device = None):
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
+
+def main():
+    config = AppConfig()
+
+    # ========================================================
+    # LOAD CHECKPOINT
+    # ========================================================
+
+    checkpoint_path = config.checkpoint_dir / "best_model.pt"
+
+    if not checkpoint_path.exists():
+        checkpoint_path = config.checkpoint_dir / "latest_model.pt"
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"No checkpoint found in {config.checkpoint_dir}. Train the model first."
         )
-        self.model = model.to(self.device)
-        self.model.eval()
 
-    def permutation_importance(
-        self,
-        test_loader: DataLoader,
-        top_k: int = 15,
-    ) -> List[Tuple[str, float]]:
-        """Compute Global Permutation Feature Importance (PFI).
+    print(f"Loading checkpoint: {checkpoint_path}")
 
-        Measures the drop in classification accuracy when each feature's
-        values are randomly permuted.
-        """
-        # Collect full test set into numpy arrays
-        all_x, all_y = [], []
-        for x_batch, y_batch in test_loader:
-            all_x.append(x_batch.numpy())
-            all_y.append(y_batch.numpy())
-        x_all = np.concatenate(all_x, axis=0)
-        y_all = np.concatenate(all_y, axis=0)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
 
-        # Baseline accuracy
-        baseline_acc = self._evaluate_accuracy(x_all, y_all)
-        print(f"[XAI] Baseline Test Accuracy: {baseline_acc * 100:.2f}%")
+    model = Net()
+    model.load_state_dict(checkpoint["model_state_dict"])
 
-        importances = {}
-        rng = np.random.default_rng(42)
+    cumulative_round = checkpoint.get("cumulative_round", "N/A")
 
-        for col_idx, feat_name in enumerate(FEATURE_NAMES):
-            # Make a copy and shuffle only this feature column
-            x_permuted = x_all.copy()
-            x_permuted[:, col_idx] = rng.permutation(x_permuted[:, col_idx])
+    print(
+        f"Loaded global model at cumulative round: "
+        f"{cumulative_round}"
+    )
 
-            # Measure performance drop
-            permuted_acc = self._evaluate_accuracy(x_permuted, y_all)
-            drop = max(0.0, baseline_acc - permuted_acc)
-            importances[feat_name] = drop
+    # ========================================================
+    # LOAD DATA
+    # ========================================================
 
-        # Sort features by highest accuracy drop
-        sorted_importances = sorted(
-            importances.items(), key=lambda item: item[1], reverse=True
+    print("\nLoading dataset...")
+
+    x_train, y_train, x_test, y_test = load_covtype_data()
+
+    x_train = to_numpy(x_train).astype(np.float32)
+    x_test = to_numpy(x_test).astype(np.float32)
+
+    print(f"Training samples: {len(x_train)}")
+    print(f"Test samples: {len(x_test)}")
+
+    test_loader = load_centralized_test_data()
+
+    # ========================================================
+    # INITIALIZE EXPLAINER
+    # ========================================================
+
+    explainer = ModelExplainer(model)
+
+    # ========================================================
+    # GLOBAL EXPLAINABILITY - PFI
+    # ========================================================
+
+    print("\nRunning Permutation Feature Importance...")
+
+    top_features = explainer.permutation_importance(
+        test_loader,
+        top_k=15,
+    )
+
+    print("\n" + "=" * 50)
+    print("TOP 15 MOST INFLUENTIAL FEATURES")
+    print("=" * 50)
+
+    for rank, (feat, drop) in enumerate(top_features, 1):
+        print(
+            f"{rank:2d}. {feat:<30} "
+            f"-> Impact: {drop * 100:.2f}% accuracy drop"
         )
-        return sorted_importances[:top_k]
 
-    def _evaluate_accuracy(self, x: np.ndarray, y: np.ndarray) -> float:
-        """Helper to evaluate accuracy on in-memory numpy data."""
-        self.model.eval()
-        correct, total = 0, len(y)
-        batch_size = 512
+    print("=" * 50)
 
-        with torch.no_grad():
-            for i in range(0, total, batch_size):
-                bx = torch.from_numpy(x[i : i + batch_size]).to(self.device)
-                by = torch.from_numpy(y[i : i + batch_size]).to(self.device)
-                outputs = self.model(bx)
-                preds = outputs.argmax(dim=-1)
-                correct += (preds == by).sum().item()
+    # Save PFI plot
+    project_root = config.checkpoint_dir.parent
+    output_plot = (
+        project_root
+        / "plots"
+        / "feature_importance.png"
+    )
 
-        return correct / total
+    explainer.plot_global_importance(
+        top_features,
+        output_plot,
+    )
 
-    def plot_global_importance(
-        self,
-        ranked_features: List[Tuple[str, float]],
-        output_path: Path,
-    ) -> None:
-        """Generate and save horizontal bar chart of top features."""
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    # ========================================================
+    # LOCAL EXPLAINABILITY - LIME
+    # ========================================================
 
-        features = [item[0] for item in reversed(ranked_features)]
-        drops = [item[1] * 100 for item in reversed(ranked_features)]  # In percent
+    print("\nInitializing LIME...")
 
-        plt.figure(figsize=(10, 6))
-        bars = plt.barh(features, drops, color="#1f77b4", edgecolor="black", alpha=0.85)
-        plt.xlabel("Accuracy Drop When Shuffled (%)", fontsize=11, fontweight="bold")
-        plt.title(
-            "Global Feature Importance (Permutation Feature Importance)",
-            fontsize=12,
-            fontweight="bold",
+    explainer.initialize_lime(x_train)
+
+    # Explain one test sample
+    sample_index = 1
+
+    print(
+        f"\nGenerating LIME explanation "
+        f"for test sample {sample_index}..."
+    )
+
+    explanation, predicted_class, probabilities = (
+        explainer.explain_instance(
+            test_data=x_test,
+            sample_index=sample_index,
+            num_features=10,
+            num_samples=5000,
         )
-        plt.grid(axis="x", linestyle="--", alpha=0.7)
+    )
 
-        # Label bars with exact drop percentages
-        for bar, drop in zip(bars, drops):
-            if drop > 0.05:
-                plt.text(
-                    bar.get_width() + 0.1,
-                    bar.get_y() + bar.get_height() / 2,
-                    f"{drop:.2f}%",
-                    va="center",
-                    fontsize=9,
-                )
+    # ========================================================
+    # SAVE LIME OUTPUTS
+    # ========================================================
 
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300)
-        plt.close()
-        print(f"[XAI] Feature importance plot saved to: {output_path}")
+    lime_plot = (
+        project_root
+        / "plots"
+        / f"lime_sample_{sample_index}.png"
+    )
+
+    lime_csv = (
+        project_root
+        / "results"
+        / f"lime_sample_{sample_index}.csv"
+    )
+
+    explainer.plot_lime_explanation(
+        explanation,
+        predicted_class,
+        lime_plot,
+    )
+
+    explainer.save_lime_explanation(
+        explanation,
+        predicted_class,
+        lime_csv,
+    )
+
+    print("\n" + "=" * 50)
+    print("EXPLAINABILITY ANALYSIS COMPLETED")
+    print("=" * 50)
+
+    print(f"PFI plot: {output_plot}")
+    print(f"LIME plot: {lime_plot}")
+    print(f"LIME CSV: {lime_csv}")
+    print(f"Explained sample: {sample_index}")
+    print(f"Predicted class: {predicted_class}")
+    print(f"Predicted label: {explainer.lime_explainer.class_names[predicted_class]}")
+    print(
+        f"Prediction confidence: "
+        f"{probabilities[predicted_class] * 100:.2f}%"
+    )
+
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()

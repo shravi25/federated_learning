@@ -43,7 +43,8 @@ def main():
     print("=" * 50)
 
     # Save plot
-    output_plot = config.project_root / "plots" / "feature_importance.png"
+    project_root = config.checkpoint_dir.parent
+    output_plot = project_root / "plots" / "feature_importance.png"
     explainer.plot_global_importance(top_features, output_plot)
 
 
