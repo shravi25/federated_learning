@@ -30,11 +30,11 @@ serverapp = "federated_app.server_app:app"
 clientapp = "federated_app.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 5
+num-server-rounds = 50
 num-clients = 5
 fraction-evaluate = 1.0
-local-epochs = 5
-learning-rate = 0.001
+local-epochs = 7
+learning-rate = 0.0005
 batch-size = 128
 auto-resume = false
 checkpoint-dir = "checkpoints"
